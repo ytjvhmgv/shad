@@ -1,6 +1,7 @@
 name: Shodan Browser Collect (login + free pages)
 
 # Cloudflare blocks GitHub IPs. Starts sing-box local mixed proxy, then Playwright uses it.
+# Deep free-page split: country -> city facet -> port facet -> org facet -> pages 1-2.
 #
 # Required secrets:
 #   SHODAN_USERNAME
@@ -37,6 +38,22 @@ on:
         description: "Max wait for Cloudflare challenge (ms)"
         required: true
         default: "60000"
+      by_city:
+        description: "After each country, open city facet and scrape per city"
+        required: true
+        default: "true"
+      max_cities:
+        description: "Max cities per country from facet"
+        required: true
+        default: "10"
+      max_ports:
+        description: "Max ports per city from facet"
+        required: true
+        default: "5"
+      max_orgs:
+        description: "Max orgs per city+port from facet"
+        required: true
+        default: "5"
 
 permissions:
   contents: read
@@ -44,7 +61,7 @@ permissions:
 jobs:
   browser-collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -201,6 +218,11 @@ jobs:
           SHODAN_MAX_COUNTRIES: ${{ github.event.inputs.max_countries }}
           SHODAN_DELAY_MS: ${{ github.event.inputs.delay_ms }}
           CF_WAIT_MS: ${{ github.event.inputs.cf_wait_ms }}
+          SHODAN_BY_CITY: ${{ github.event.inputs.by_city }}
+          SHODAN_MAX_CITIES: ${{ github.event.inputs.max_cities }}
+          SHODAN_MAX_PORTS: ${{ github.event.inputs.max_ports }}
+          SHODAN_MAX_ORGS: ${{ github.event.inputs.max_orgs }}
+          SHODAN_DEEP: true
           SHODAN_USERNAME: ${{ secrets.SHODAN_USERNAME }}
           SHODAN_PASSWORD: ${{ secrets.SHODAN_PASSWORD }}
           SHODAN_COOKIE: ${{ secrets.SHODAN_COOKIE }}
@@ -219,6 +241,11 @@ jobs:
             --countries "$SHODAN_COUNTRIES" \
             --max-pages "$PAGES" \
             --max-countries "$SHODAN_MAX_COUNTRIES" \
+            --max-cities "$SHODAN_MAX_CITIES" \
+            --max-ports "$SHODAN_MAX_PORTS" \
+            --max-orgs "$SHODAN_MAX_ORGS" \
+            --by-city "$SHODAN_BY_CITY" \
+            --deep true \
             --delay "$SHODAN_DELAY_MS" \
             --cf-wait "$CF_WAIT_MS" \
             --proxy "$PROXY_URL" \
@@ -241,6 +268,10 @@ jobs:
             out/hosts.csv
             out/hosts.txt
             out/browser-summary.json
+            out/cities.json
+            out/cities-*.json
+            out/facet-tree.json
+            out/facet-*.json
             out/shodan-storage-state.json
             out/debug-*.png
             out/debug-*.html
