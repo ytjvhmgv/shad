@@ -45,15 +45,15 @@ on:
       max_cities:
         description: "Max cities per country from facet"
         required: true
-        default: "10"
+        default: "20"
       max_ports:
         description: "Max ports per city from facet"
         required: true
-        default: "5"
+        default: "20"
       max_orgs:
         description: "Max orgs per city+port from facet"
         required: true
-        default: "5"
+        default: "20"
       split_threshold:
         description: "If bucket count <= this, paginate here and do not go deeper"
         required: true
