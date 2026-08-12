@@ -38,6 +38,8 @@ async function main() {
   const username = args.username || process.env.SHODAN_USERNAME || "";
   const password = args.password || process.env.SHODAN_PASSWORD || "";
   const cookie = args.cookie || process.env.SHODAN_COOKIE || "";
+  const proxyUrl = args.proxy || process.env.PROXY_URL || process.env.SHODAN_PROXY || "";
+  const cfWaitMs = clampInt(args.cfWait || process.env.CF_WAIT_MS || 45000, 0, 180000);
   const continueUrl = args.continueUrl || process.env.SHODAN_CONTINUE_URL || "https://www.shodan.io";
   const countries = parseCountries(
     args.countries || process.env.SHODAN_COUNTRIES || FALLBACK_COUNTRIES.join(",")
@@ -58,21 +60,31 @@ async function main() {
   console.log(`Max free pages/country: ${maxPages}`);
   console.log(`Headless: ${headless}`);
   console.log(`Auth mode: ${username ? "username/password login" : "cookie only"}`);
+  const proxy = parseProxy(proxyUrl);
+  console.log(`Proxy: ${proxy ? redactProxy(proxyUrl) : "(none)"}`);
+  if (!proxy) {
+    console.warn("WARNING: No PROXY_URL. GitHub Actions IPs are often blocked by Cloudflare on account.shodan.io");
+  }
 
-  const browser = await chromium.launch({
+  const launchOpts = {
     headless,
     args: [
       "--disable-blink-features=AutomationControlled",
       "--no-sandbox",
       "--disable-dev-shm-usage",
     ],
-  });
+  };
+  // parseProxy may already be called above; re-safe
+  const proxyForLaunch = typeof proxy !== "undefined" ? proxy : parseProxy(proxyUrl);
+  if (proxyForLaunch) launchOpts.proxy = proxyForLaunch;
+  const browser = await chromium.launch(launchOpts);
 
   const context = await browser.newContext({
     userAgent:
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     locale: "en-US",
     viewport: { width: 1400, height: 900 },
+    ignoreHTTPSErrors: true,
   });
 
   // Mild stealth: hide webdriver flag
@@ -97,6 +109,7 @@ async function main() {
         password,
         continueUrl,
         outDir,
+        cfWaitMs,
       });
       if (!loginOk) {
         await dumpDebug(page, outDir, "login-failed");
@@ -128,7 +141,7 @@ async function main() {
 
         try {
           const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-          await page.waitForTimeout(1500);
+          await waitForCloudflare(page, cfWaitMs);
           title = await page.title().catch(() => "");
           const finalUrl = page.url();
           const html = await page.content();
@@ -202,6 +215,7 @@ async function main() {
         max_pages: maxPages,
         countries,
         login_ok: loginOk,
+        proxy: (typeof proxy !== 'undefined' && proxy) ? redactProxy(proxyUrl) : (proxyUrl ? redactProxy(proxyUrl) : null),
         auth_mode: username ? "password" : "cookie",
         unique_hosts: unique.length,
         note: "Logged-in free pages only (1-2). Not a paid pagination bypass.",
@@ -245,7 +259,7 @@ async function main() {
   }
 }
 
-async function loginShodan(page, { username, password, continueUrl, outDir }) {
+async function loginShodan(page, { username, password, continueUrl, outDir, cfWaitMs }) {
   console.log(`\nLogging in via ${LOGIN_URL} ...`);
 
   // Prefer continue back to www.shodan.io after auth
@@ -253,11 +267,10 @@ async function loginShodan(page, { username, password, continueUrl, outDir }) {
   // page itself uses hidden continue field; we also set it after load
 
   const resp = await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(800);
-
+  const passedCf = await waitForCloudflare(page, cfWaitMs || 45000);
   const title = await page.title().catch(() => "");
   const html = await page.content();
-  if (looksBlocked(html, title, page.url(), resp ? resp.status() : 0)) {
+  if (!passedCf || looksBlocked(html, title, page.url(), resp ? resp.status() : 0)) {
     console.error("Login page blocked by captcha/cloudflare");
     await dumpDebug(page, outDir, "login-blocked");
     return false;
@@ -376,6 +389,64 @@ async function isLoggedInDom(page) {
     return true;
   }
   return false;
+}
+
+
+function parseProxy(raw) {
+  const str = String(raw || "").trim();
+  if (!str) return null;
+  let urlStr = str;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(str)) {
+    const parts = str.split(":");
+    if (parts.length === 2) urlStr = "socks5://" + parts[0] + ":" + parts[1];
+    else if (parts.length >= 4) {
+      const host = parts[0], port = parts[1], user = parts[2], pass = parts.slice(3).join(":");
+      urlStr = "socks5://" + encodeURIComponent(user) + ":" + encodeURIComponent(pass) + "@" + host + ":" + port;
+    } else throw new Error("Unrecognized PROXY_URL format: " + str);
+  }
+  let u;
+  try { u = new URL(urlStr); } catch { throw new Error("Invalid PROXY_URL: " + str); }
+  const protocol = u.protocol.replace(":", "").toLowerCase();
+  if (!["socks5", "socks5h", "socks4", "http", "https"].includes(protocol)) {
+    throw new Error("Unsupported proxy protocol: " + protocol);
+  }
+  const serverProtocol = protocol === "socks5h" ? "socks5" : protocol;
+  const defPort = serverProtocol.startsWith("socks") ? "1080" : serverProtocol === "https" ? "443" : "8080";
+  const out = { server: serverProtocol + "://" + u.hostname + ":" + (u.port || defPort) };
+  if (u.username) out.username = decodeURIComponent(u.username);
+  if (u.password) out.password = decodeURIComponent(u.password);
+  return out;
+}
+
+function redactProxy(raw) {
+  try {
+    const p = parseProxy(raw);
+    if (!p) return "";
+    return p.username ? p.server + " (auth=yes)" : p.server;
+  } catch { return "(set)"; }
+}
+
+async function waitForCloudflare(page, timeoutMs) {
+  const budget = Math.max(0, Number(timeoutMs) || 0);
+  if (!budget) return true;
+  const start = Date.now();
+  while (Date.now() - start < budget) {
+    const title = (await page.title().catch(() => "")).toLowerCase();
+    const html = await page.content().catch(() => "");
+    const blocked =
+      title.includes("just a moment") ||
+      title.includes("attention required") ||
+      /performing security verification/i.test(html) ||
+      /cf-browser-verification|cf-challenge|challenge-platform/i.test(html);
+    if (!blocked) {
+      const hasForm = (await page.locator("#username, input[name='username'], .result-container, a[href*='logout']").count().catch(() => 0)) > 0;
+      const hasBody = html.length > 1500 && !/Enable JavaScript and cookies to continue/i.test(html);
+      if (hasForm || hasBody) return true;
+    }
+    await page.waitForTimeout(1500);
+  }
+  const title = await page.title().catch(() => "");
+  return !/just a moment|attention required/i.test(title);
 }
 
 async function dumpDebug(page, outDir, tag) {
