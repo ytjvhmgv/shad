@@ -1,14 +1,14 @@
 name: Shodan Browser Collect (login + free pages)
 
-# 1) Logs into https://account.shodan.io/login with repo secrets
-# 2) Scrapes only free result pages (max 2 / country)
-# 3) Extracts host:port and uploads artifact
+# Cloudflare blocks GitHub IPs. Starts sing-box local mixed proxy, then Playwright uses it.
 #
 # Required secrets:
 #   SHODAN_USERNAME
 #   SHODAN_PASSWORD
+#   SOCKS5_URL          e.g. socks5://user:pass@1.2.3.4:1080  OR  1.2.3.4:1080:user:pass
 # Optional:
-#   SHODAN_COOKIE  (fallback / extra session cookies)
+#   SINGBOX_CONFIG      full sing-box JSON
+#   SHODAN_COOKIE
 
 on:
   workflow_dispatch:
@@ -26,13 +26,17 @@ on:
         required: true
         default: "2"
       max_countries:
-        description: "Max countries to process from the list"
+        description: "Max countries from list"
         required: true
         default: "10"
       delay_ms:
         description: "Delay between page loads (ms)"
         required: true
         default: "3000"
+      cf_wait_ms:
+        description: "Max wait for Cloudflare challenge (ms)"
+        required: true
+        default: "60000"
 
 permissions:
   contents: read
@@ -57,56 +61,176 @@ jobs:
           npm install
           npx playwright install --with-deps chromium
 
-      - name: Check login secrets
+      - name: Check secrets
         env:
           SHODAN_USERNAME: ${{ secrets.SHODAN_USERNAME }}
           SHODAN_PASSWORD: ${{ secrets.SHODAN_PASSWORD }}
           SHODAN_COOKIE: ${{ secrets.SHODAN_COOKIE }}
+          SOCKS5_URL: ${{ secrets.SOCKS5_URL }}
+          SINGBOX_CONFIG: ${{ secrets.SINGBOX_CONFIG }}
         run: |
           if [ -z "$SHODAN_USERNAME" ] || [ -z "$SHODAN_PASSWORD" ]; then
             if [ -z "$SHODAN_COOKIE" ]; then
-              echo "::error::Set secrets SHODAN_USERNAME + SHODAN_PASSWORD (or SHODAN_COOKIE)."
+              echo "::error::Need SHODAN_USERNAME + SHODAN_PASSWORD (or SHODAN_COOKIE)"
               exit 1
             fi
-            echo "WARNING: using SHODAN_COOKIE fallback without username/password"
-          else
-            echo "Login secrets present"
           fi
+          if [ -z "$SOCKS5_URL" ] && [ -z "$SINGBOX_CONFIG" ]; then
+            echo "::error::Set secret SOCKS5_URL (or SINGBOX_CONFIG). GitHub IP is blocked by Cloudflare."
+            echo "Example: socks5://user:pass@host:1080"
+            exit 1
+          fi
+          echo "Secrets present"
 
-      - name: Login + collect free pages
+      - name: Install sing-box
+        run: |
+          set -euo pipefail
+          VER="1.11.15"
+          curl -fsSL -o sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
+          tar -xzf sing-box.tar.gz
+          install -m 755 "sing-box-${VER}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version
+
+      - name: Start sing-box (127.0.0.1:2080)
+        env:
+          SOCKS5_URL: ${{ secrets.SOCKS5_URL }}
+          SINGBOX_CONFIG: ${{ secrets.SINGBOX_CONFIG }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json, os, re, urllib.parse, pathlib
+          raw_cfg = (os.environ.get("SINGBOX_CONFIG") or "").strip()
+          socks = (os.environ.get("SOCKS5_URL") or "").strip()
+          out = pathlib.Path("singbox-config.json")
+
+          if raw_cfg:
+              cfg = json.loads(raw_cfg)
+              inbounds = cfg.get("inbounds") or []
+              has_local = any(
+                  str(ib.get("listen") or "") in ("127.0.0.1", "localhost", "::1")
+                  and int(ib.get("listen_port") or 0) == 2080
+                  for ib in inbounds
+              )
+              if not has_local:
+                  inbounds.insert(0, {
+                      "type": "mixed",
+                      "tag": "mixed-in",
+                      "listen": "127.0.0.1",
+                      "listen_port": 2080,
+                  })
+                  cfg["inbounds"] = inbounds
+              if "route" not in cfg:
+                  obs = cfg.get("outbounds") or []
+                  final_tag = next((o.get("tag") for o in obs if o.get("type") not in ("direct", "block", "dns")), None)
+                  if final_tag:
+                      cfg["route"] = {"final": final_tag}
+              out.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+              print("Using SINGBOX_CONFIG (+ local mixed :2080)")
+          else:
+              s = socks
+              if not re.match(r"^[a-z][a-z0-9+.-]*://", s, re.I):
+                  parts = s.split(":")
+                  if len(parts) == 2:
+                      s = f"socks5://{parts[0]}:{parts[1]}"
+                  elif len(parts) >= 4:
+                      host, port, user = parts[0], parts[1], parts[2]
+                      pwd = ":".join(parts[3:])
+                      s = f"socks5://{urllib.parse.quote(user)}:{urllib.parse.quote(pwd)}@{host}:{port}"
+                  else:
+                      raise SystemExit(f"bad SOCKS5_URL: {socks}")
+              u = urllib.parse.urlparse(s)
+              if u.scheme not in ("socks5", "socks5h", "socks4", "http", "https"):
+                  raise SystemExit(f"unsupported scheme: {u.scheme}")
+              outbound_type = "socks" if u.scheme.startswith("socks") else "http"
+              outbound = {
+                  "type": outbound_type,
+                  "tag": "proxy",
+                  "server": u.hostname,
+                  "server_port": int(u.port or (1080 if outbound_type == "socks" else 8080)),
+              }
+              if u.username:
+                  outbound["username"] = urllib.parse.unquote(u.username)
+              if u.password:
+                  outbound["password"] = urllib.parse.unquote(u.password)
+              if outbound_type == "socks":
+                  outbound["version"] = "5"
+              cfg = {
+                  "log": {"level": "info", "timestamp": True},
+                  "inbounds": [{
+                      "type": "mixed",
+                      "tag": "mixed-in",
+                      "listen": "127.0.0.1",
+                      "listen_port": 2080
+                  }],
+                  "outbounds": [
+                      outbound,
+                      {"type": "direct", "tag": "direct"},
+                      {"type": "block", "tag": "block"}
+                  ],
+                  "route": {"final": "proxy"}
+              }
+              out.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+              print(f"Generated sing-box -> {outbound_type} {u.hostname}:{outbound['server_port']}")
+          PY
+
+          nohup sing-box run -c singbox-config.json > singbox.log 2>&1 &
+          echo $! > singbox.pid
+          sleep 2
+          if ! kill -0 "$(cat singbox.pid)" 2>/dev/null; then
+            echo "::error::sing-box failed to start"
+            cat singbox.log || true
+            exit 1
+          fi
+          python3 - <<'PY'
+          import socket, sys
+          s=socket.socket(); s.settimeout(2)
+          try:
+            s.connect(("127.0.0.1", 2080))
+            print("sing-box mixed listening on 127.0.0.1:2080")
+          except Exception as e:
+            print("port not open:", e); sys.exit(1)
+          finally:
+            s.close()
+          PY
+
+      - name: Login + collect free pages via proxy
         env:
           SHODAN_QUERY: ${{ github.event.inputs.query }}
           SHODAN_COUNTRIES: ${{ github.event.inputs.countries }}
           SHODAN_MAX_PAGES: ${{ github.event.inputs.max_pages }}
           SHODAN_MAX_COUNTRIES: ${{ github.event.inputs.max_countries }}
           SHODAN_DELAY_MS: ${{ github.event.inputs.delay_ms }}
+          CF_WAIT_MS: ${{ github.event.inputs.cf_wait_ms }}
           SHODAN_USERNAME: ${{ secrets.SHODAN_USERNAME }}
           SHODAN_PASSWORD: ${{ secrets.SHODAN_PASSWORD }}
           SHODAN_COOKIE: ${{ secrets.SHODAN_COOKIE }}
+          PROXY_URL: socks5://127.0.0.1:2080
           SHODAN_CONTINUE_URL: https://www.shodan.io
           SHODAN_OUT_DIR: out
           HEADLESS: "true"
         run: |
           set -euo pipefail
           mkdir -p out
-
-          PAGES="${SHODAN_MAX_PAGES}"
+          PAGES="$SHODAN_MAX_PAGES"
           if [ "$PAGES" -gt 2 ]; then PAGES=2; fi
           if [ "$PAGES" -lt 1 ]; then PAGES=1; fi
-
           node shodan-browser-collect.js \
             --query "$SHODAN_QUERY" \
             --countries "$SHODAN_COUNTRIES" \
             --max-pages "$PAGES" \
             --max-countries "$SHODAN_MAX_COUNTRIES" \
             --delay "$SHODAN_DELAY_MS" \
+            --cf-wait "$CF_WAIT_MS" \
+            --proxy "$PROXY_URL" \
             --out-dir out
-
-          echo "---- sample ----"
           head -n 30 out/hosts.txt || true
-          echo "---- counts ----"
           wc -l out/hosts.txt out/hosts.csv || true
-          ls -lah out || true
+
+      - name: Stop sing-box
+        if: always()
+        run: |
+          if [ -f singbox.pid ]; then kill "$(cat singbox.pid)" || true; fi
+          tail -n 100 singbox.log || true
 
       - name: Upload hosts artifact
         if: always()
@@ -121,5 +245,6 @@ jobs:
             out/debug-*.png
             out/debug-*.html
             out/debug-*-meta.json
+            singbox.log
           if-no-files-found: warn
           retention-days: 14
