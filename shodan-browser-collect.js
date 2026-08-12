@@ -31,6 +31,8 @@ async function main() {
   const maxCities = clampInt(args.maxCities || process.env.SHODAN_MAX_CITIES || 15, 0, 200);
   const maxPorts = clampInt(args.maxPorts || process.env.SHODAN_MAX_PORTS || 8, 0, 100);
   const maxOrgs = clampInt(args.maxOrgs || process.env.SHODAN_MAX_ORGS || 8, 0, 100);
+  // If current bucket result count <= threshold, do NOT go deeper; paginate here.
+  const splitThreshold = clampInt(args.splitThreshold || process.env.SHODAN_SPLIT_THRESHOLD || 20, 1, 1000);
   const outDir = args.outDir || process.env.SHODAN_OUT_DIR || "out";
   const headless = String(args.headless ?? process.env.HEADLESS ?? "true").toLowerCase() !== "false";
   const username = String(args.username || process.env.SHODAN_USERNAME || "").trim();
@@ -57,6 +59,7 @@ async function main() {
   console.log("Query:", query);
   console.log("Countries:", countries.join(","));
   console.log("Deep facet chain:", deep ? "country -> city -> port -> org -> pages" : (byCity ? "country -> city -> pages" : "country -> pages"));
+  console.log("Split only when count > " + splitThreshold + " (count <= threshold => paginate here)");
   console.log("Limits: cities/country=" + maxCities + " ports/city=" + maxPorts + " orgs/port=" + maxOrgs + " pages=" + maxPages);
   console.log("Proxy:", proxy ? redactProxy(proxyUrl) : "(none)");
 
@@ -99,114 +102,245 @@ async function main() {
       if (!loginOk) die("Cookie session invalid");
     }
 
-    for (const country of countries) {
-      if (stopAll) break;
-      const countryNode = { country, cities: [] };
-      tree.push(countryNode);
+    // Helper: scrape free pages for a concrete query bucket
+    async function scrapeBucket(parts, meta) {
+      for (let pageNo = 1; pageNo <= maxPages; pageNo++) {
+        if (stopAll) return;
+        const q = buildQuery(query, parts);
+        const url = buildSearchUrl(q, pageNo);
+        const label = [parts.country, parts.city, parts.port ? ("p" + parts.port) : null, parts.org]
+          .filter(Boolean)
+          .join("/");
+        console.log("\n>>> " + label + " page " + pageNo + (meta && meta.reason ? " [" + meta.reason + "]" : ""));
+        console.log("    " + url);
+        try {
+          const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+          await waitForCloudflare(page, cfWaitMs);
+          const title = await page.title().catch(() => "");
+          const finalUrl = page.url();
+          const html = await page.content();
 
-      let cityList = [{ name: null, count: null }];
-      if (byCity || deep) {
-        console.log("\n=== " + country + " city facet ===");
-        const cities = await fetchFacetValues(page, {
-          query, country, city: null, port: null, facet: "city",
-          limit: maxCities || 50, outDir, cfWaitMs, delayMs,
-        });
-        cityList = cities.length ? cities : [{ name: null, count: null }];
-        console.log("  cities:", cityList.filter(x=>x.name).slice(0,10).map(c => c.name + "(" + (c.count||"?") + ")").join(", ") || "(country only fallback)");
-      }
-
-      for (const cityObj of cityList) {
-        if (stopAll) break;
-        const city = cityObj.name;
-        const cityNode = { city, count: cityObj.count, ports: [] };
-        countryNode.cities.push(cityNode);
-
-        let portList = [{ name: null, count: null }];
-        if (deep && maxPorts > 0 && city) {
-          console.log("\n--- " + country + "/" + city + " port facet ---");
-          const ports = await fetchFacetValues(page, {
-            query, country, city, port: null, facet: "port",
-            limit: maxPorts, outDir, cfWaitMs, delayMs,
-          });
-          portList = ports.length ? ports : [{ name: null, count: null }];
-          console.log("  ports:", portList.filter(x=>x.name).map(p => p.name + "(" + (p.count||"?") + ")").join(", ") || "(no port split)");
-        }
-
-        for (const portObj of portList) {
-          if (stopAll) break;
-          const port = portObj.name; // string port number or null
-          const portNode = { port, count: portObj.count, orgs: [] };
-          cityNode.ports.push(portNode);
-
-          let orgList = [{ name: null, count: null }];
-          if (deep && maxOrgs > 0 && city && port) {
-            console.log("\n... " + country + "/" + city + "/port:" + port + " org facet ...");
-            const orgs = await fetchFacetValues(page, {
-              query, country, city, port, facet: "org",
-              limit: maxOrgs, outDir, cfWaitMs, delayMs,
-            });
-            orgList = orgs.length ? orgs : [{ name: null, count: null }];
-            console.log("  orgs:", orgList.filter(x=>x.name).slice(0,8).map(o => o.name + "(" + (o.count||"?") + ")").join(" | ") || "(no org split)");
+          if (/account\.shodan\.io\/login/i.test(finalUrl)) {
+            summary.push({ ...parts, page: pageNo, hosts: 0, status: "session_lost", title, reason: meta && meta.reason });
+            await dumpDebug(page, outDir, "session-lost");
+            stopAll = true;
+            return;
+          }
+          if (looksBlocked(html, title, finalUrl, resp ? resp.status() : 0)) {
+            summary.push({ ...parts, page: pageNo, hosts: 0, status: "blocked", title, reason: meta && meta.reason });
+            await dumpDebug(page, outDir, "blocked-" + safeTag(label) + "-p" + pageNo);
+            return;
           }
 
-          for (const orgObj of orgList) {
+          let hosts = extractHostsFromHtml(html);
+          const live = await page
+            .$$eval('a[href*="://"]', (as) =>
+              as
+                .map((a) => a.getAttribute("href") || "")
+                .filter((h) => /https?:\/\/(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}/i.test(h))
+            )
+            .catch(() => []);
+          for (const href of live) {
+            const m = href.match(/((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})/);
+            if (m) hosts.push(m[1] + ":" + m[2]);
+          }
+          hosts = uniquePreserveOrder(hosts);
+          allHosts.push(...hosts);
+          console.log("    hosts=" + hosts.length + " sample=" + (hosts.slice(0, 3).join(", ") || "-"));
+
+          const hasNext = await page
+            .locator('div.pagination a:has-text("Next"), a.button:has-text("Next")')
+            .count();
+          summary.push({
+            ...parts,
+            page: pageNo,
+            hosts: hosts.length,
+            status: "ok",
+            title,
+            reason: meta && meta.reason,
+            count: meta && meta.count,
+          });
+          if (pageNo < maxPages && hasNext === 0) return;
+        } catch (err) {
+          console.error("    error:", err.message);
+          summary.push({ ...parts, page: pageNo, hosts: 0, status: "error", error: err.message, reason: meta && meta.reason });
+          await dumpDebug(page, outDir, "error-" + safeTag(label) + "-p" + pageNo).catch(() => {});
+          return;
+        }
+        if (delayMs) await page.waitForTimeout(delayMs);
+      }
+    }
+
+    function shouldSplit(count) {
+      // unknown count => allow split attempt (facet may still help)
+      if (count == null || count === "") return true;
+      const n = Number(count);
+      if (!Number.isFinite(n)) return true;
+      return n > splitThreshold;
+    }
+
+    for (const country of countries) {
+      if (stopAll) break;
+      const countryNode = { country, decision: null, cities: [] };
+      tree.push(countryNode);
+
+      // Country level: we usually don't know exact total; use city facet when deep/byCity.
+      // If city facet fails/empty, paginate at country level.
+      if (!(byCity || deep) || maxCities <= 0) {
+        countryNode.decision = "paginate-country (city split disabled)";
+        await scrapeBucket({ country, city: null, port: null, org: null }, { reason: countryNode.decision });
+        continue;
+      }
+
+      console.log("\n=== " + country + " city facet ===");
+      const cities = await fetchFacetValues(page, {
+        query,
+        country,
+        city: null,
+        port: null,
+        facet: "city",
+        limit: maxCities,
+        outDir,
+        cfWaitMs,
+        delayMs,
+      });
+
+      if (!cities.length) {
+        countryNode.decision = "paginate-country (no city facet)";
+        await scrapeBucket({ country, city: null, port: null, org: null }, { reason: countryNode.decision });
+        continue;
+      }
+
+      // Optional: if ALL city counts sum < threshold, still iterate cities but each may paginate early.
+      console.log(
+        "  cities:",
+        cities
+          .slice(0, 10)
+          .map((c) => c.name + "(" + (c.count != null ? c.count : "?") + ")")
+          .join(", ")
+      );
+
+      for (const cityObj of cities) {
+        if (stopAll) break;
+        const city = cityObj.name;
+        const cityCount = cityObj.count;
+        const cityNode = { city, count: cityCount, decision: null, ports: [] };
+        countryNode.cities.push(cityNode);
+
+        if (!shouldSplit(cityCount) || !deep) {
+          cityNode.decision =
+            !deep ? "paginate-city (deep=false)" : "paginate-city (count<=" + splitThreshold + ")";
+          console.log("  -> " + country + "/" + city + " " + cityNode.decision + " count=" + cityCount);
+          await scrapeBucket(
+            { country, city, port: null, org: null },
+            { reason: cityNode.decision, count: cityCount }
+          );
+          continue;
+        }
+
+        // city large enough -> port facet
+        if (maxPorts <= 0) {
+          cityNode.decision = "paginate-city (maxPorts=0)";
+          await scrapeBucket({ country, city, port: null, org: null }, { reason: cityNode.decision, count: cityCount });
+          continue;
+        }
+
+        console.log("\n--- " + country + "/" + city + " port facet (city count=" + cityCount + ") ---");
+        const ports = await fetchFacetValues(page, {
+          query,
+          country,
+          city,
+          port: null,
+          facet: "port",
+          limit: maxPorts,
+          outDir,
+          cfWaitMs,
+          delayMs,
+        });
+
+        if (!ports.length) {
+          cityNode.decision = "paginate-city (no port facet)";
+          await scrapeBucket({ country, city, port: null, org: null }, { reason: cityNode.decision, count: cityCount });
+          continue;
+        }
+
+        console.log(
+          "  ports:",
+          ports.map((p) => p.name + "(" + (p.count != null ? p.count : "?") + ")").join(", ")
+        );
+
+        for (const portObj of ports) {
+          if (stopAll) break;
+          const port = portObj.name;
+          const portCount = portObj.count;
+          const portNode = { port, count: portCount, decision: null, orgs: [] };
+          cityNode.ports.push(portNode);
+
+          if (!shouldSplit(portCount)) {
+            portNode.decision = "paginate-port (count<=" + splitThreshold + ")";
+            console.log("  -> " + country + "/" + city + "/p" + port + " " + portNode.decision + " count=" + portCount);
+            await scrapeBucket(
+              { country, city, port, org: null },
+              { reason: portNode.decision, count: portCount }
+            );
+            continue;
+          }
+
+          if (maxOrgs <= 0) {
+            portNode.decision = "paginate-port (maxOrgs=0)";
+            await scrapeBucket({ country, city, port, org: null }, { reason: portNode.decision, count: portCount });
+            continue;
+          }
+
+          console.log(
+            "\n... " + country + "/" + city + "/port:" + port + " org facet (port count=" + portCount + ") ..."
+          );
+          const orgs = await fetchFacetValues(page, {
+            query,
+            country,
+            city,
+            port,
+            facet: "org",
+            limit: maxOrgs,
+            outDir,
+            cfWaitMs,
+            delayMs,
+          });
+
+          if (!orgs.length) {
+            portNode.decision = "paginate-port (no org facet)";
+            await scrapeBucket({ country, city, port, org: null }, { reason: portNode.decision, count: portCount });
+            continue;
+          }
+
+          console.log(
+            "  orgs:",
+            orgs
+              .slice(0, 8)
+              .map((o) => o.name + "(" + (o.count != null ? o.count : "?") + ")")
+              .join(" | ")
+          );
+
+          for (const orgObj of orgs) {
             if (stopAll) break;
             const org = orgObj.name;
-            portNode.orgs.push({ org, count: orgObj.count });
-
-            for (let pageNo = 1; pageNo <= maxPages; pageNo++) {
-              const q = buildQuery(query, { country, city, port, org });
-              const url = buildSearchUrl(q, pageNo);
-              const label = [country, city, port ? "p"+port : null, org].filter(Boolean).join("/");
-              console.log("\n>>> " + label + " page " + pageNo);
-              console.log("    " + url);
-
-              try {
-                const resp = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
-                await waitForCloudflare(page, cfWaitMs);
-                const title = await page.title().catch(() => "");
-                const finalUrl = page.url();
-                const html = await page.content();
-
-                if (/account\.shodan\.io\/login/i.test(finalUrl)) {
-                  summary.push({ country, city, port, org, page: pageNo, hosts: 0, status: "session_lost", title });
-                  await dumpDebug(page, outDir, "session-lost");
-                  stopAll = true;
-                  break;
-                }
-                if (looksBlocked(html, title, finalUrl, resp ? resp.status() : 0)) {
-                  summary.push({ country, city, port, org, page: pageNo, hosts: 0, status: "blocked", title });
-                  await dumpDebug(page, outDir, "blocked-" + safeTag(label) + "-p" + pageNo);
-                  break;
-                }
-
-                let hosts = extractHostsFromHtml(html);
-                const live = await page.$$eval('a[href*="://"]', (as) =>
-                  as.map((a) => a.getAttribute("href") || "").filter((h) => /https?:\/\/(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}/i.test(h))
-                ).catch(() => []);
-                for (const href of live) {
-                  const m = href.match(/((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})/);
-                  if (m) hosts.push(m[1] + ":" + m[2]);
-                }
-                hosts = uniquePreserveOrder(hosts);
-                allHosts.push(...hosts);
-                console.log("    hosts=" + hosts.length + " sample=" + (hosts.slice(0,3).join(", ") || "-"));
-
-                const hasNext = await page.locator('div.pagination a:has-text("Next"), a.button:has-text("Next")').count();
-                summary.push({ country, city, port, org, page: pageNo, hosts: hosts.length, status: "ok", title });
-                if (pageNo < maxPages && hasNext === 0) break;
-              } catch (err) {
-                console.error("    error:", err.message);
-                summary.push({ country, city, port, org, page: pageNo, hosts: 0, status: "error", error: err.message });
-                await dumpDebug(page, outDir, "error-" + safeTag(label) + "-p" + pageNo).catch(() => {});
-                break;
-              }
-              if (delayMs) await page.waitForTimeout(delayMs);
-            }
+            const orgCount = orgObj.count;
+            // org is leaf level: always paginate (no deeper facet)
+            const decision =
+              orgCount != null && orgCount <= splitThreshold
+                ? "paginate-org (leaf, count<=" + splitThreshold + ")"
+                : "paginate-org (leaf)";
+            portNode.orgs.push({ org, count: orgCount, decision });
+            console.log("  -> org=" + org + " " + decision + " count=" + orgCount);
+            await scrapeBucket(
+              { country, city, port, org },
+              { reason: decision, count: orgCount }
+            );
           }
         }
       }
     }
+
   } finally {
     await browser.close();
   }
@@ -214,7 +348,7 @@ async function main() {
   const unique = uniquePreserveOrder(allHosts);
   fs.writeFileSync(path.join(outDir, "hosts.csv"), ["host", ...unique].join("\n") + "\n", "utf8");
   fs.writeFileSync(path.join(outDir, "hosts.txt"), unique.join("\n") + (unique.length ? "\n" : ""), "utf8");
-  fs.writeFileSync(path.join(outDir, "facet-tree.json"), JSON.stringify({ query, deep, limits: { maxCountries, maxCities, maxPorts, maxOrgs, maxPages }, tree }, null, 2) + "\n", "utf8");
+  fs.writeFileSync(path.join(outDir, "facet-tree.json"), JSON.stringify({ query, deep, limits: { maxCountries, maxCities, maxPorts, maxOrgs, maxPages, splitThreshold }, tree }, null, 2) + "\n", "utf8");
   fs.writeFileSync(path.join(outDir, "browser-summary.json"), JSON.stringify({
     query, deep, login_ok: loginOk, proxy: proxy ? redactProxy(proxyUrl) : null,
     unique_hosts: unique.length, rows: summary,
@@ -229,10 +363,10 @@ async function main() {
       "- Chain: country → city → port → org → pages",
       "- Unique hosts: **" + unique.length + "**",
       "",
-      "| Country | City | Port | Org | Page | Hosts | Status |",
-      "|---|---|---|---|---:|---:|---|",
+      "| Country | City | Port | Org | Page | Hosts | Status | Reason |",
+      "|---|---|---|---|---:|---:|---|---|",
       ...summary.slice(0, 300).map((r) =>
-        "| " + [r.country, r.city||"-", r.port||"-", (r.org||"-").toString().replace(/\|/g,"/").slice(0,40), r.page, r.hosts||0, r.status||""].join(" | ") + " |"
+        "| " + [r.country, r.city||"-", r.port||"-", (r.org||"-").toString().replace(/\|/g,"/").slice(0,40), r.page, r.hosts||0, r.status||"", (r.reason||"").toString().replace(/\|/g,"/").slice(0,40)].join(" | ") + " |"
       ),
       "",
     ];
