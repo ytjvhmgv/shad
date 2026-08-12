@@ -1,0 +1,14 @@
+node_modules/
+out/
+playwright-report/
+test-results/
+.dev.vars
+.env
+.env.*
+!.env.example
+*.log
+shodan-storage-state.json
+debug-*.html
+debug-*.png
+debug-*-meta.json
+.DS_Store

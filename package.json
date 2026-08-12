@@ -1,0 +1,17 @@
+{
+  "name": "shodan-host-collector",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Collect free-tier Shodan host:port results by country",
+  "scripts": {
+    "collect:api": "node shodan-api-collect.js",
+    "collect:browser": "node shodan-browser-collect.js",
+    "parse:html": "node parse-shodan-html.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
