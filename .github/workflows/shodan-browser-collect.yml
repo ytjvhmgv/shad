@@ -54,6 +54,10 @@ on:
         description: "Max orgs per city+port from facet"
         required: true
         default: "5"
+      split_threshold:
+        description: "If bucket count <= this, paginate here and do not go deeper"
+        required: true
+        default: "20"
 
 permissions:
   contents: read
@@ -223,6 +227,7 @@ jobs:
           SHODAN_MAX_PORTS: ${{ github.event.inputs.max_ports }}
           SHODAN_MAX_ORGS: ${{ github.event.inputs.max_orgs }}
           SHODAN_DEEP: true
+          SHODAN_SPLIT_THRESHOLD: ${{ github.event.inputs.split_threshold }}
           SHODAN_USERNAME: ${{ secrets.SHODAN_USERNAME }}
           SHODAN_PASSWORD: ${{ secrets.SHODAN_PASSWORD }}
           SHODAN_COOKIE: ${{ secrets.SHODAN_COOKIE }}
@@ -246,6 +251,7 @@ jobs:
             --max-orgs "$SHODAN_MAX_ORGS" \
             --by-city "$SHODAN_BY_CITY" \
             --deep true \
+            --split-threshold "$SHODAN_SPLIT_THRESHOLD" \
             --delay "$SHODAN_DELAY_MS" \
             --cf-wait "$CF_WAIT_MS" \
             --proxy "$PROXY_URL" \
