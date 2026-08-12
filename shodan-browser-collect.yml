@@ -1,0 +1,125 @@
+name: Shodan Browser Collect (login + free pages)
+
+# 1) Logs into https://account.shodan.io/login with repo secrets
+# 2) Scrapes only free result pages (max 2 / country)
+# 3) Extracts host:port and uploads artifact
+#
+# Required secrets:
+#   SHODAN_USERNAME
+#   SHODAN_PASSWORD
+# Optional:
+#   SHODAN_COOKIE  (fallback / extra session cookies)
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "Shodan query"
+        required: true
+        default: "http.favicon.hash:-1875761561"
+      countries:
+        description: "ISO country codes, comma-separated"
+        required: true
+        default: "US,JP,SG,DE,CN,HK,KR,GB,FR,NL"
+      max_pages:
+        description: "Free pages per country (1 or 2 only)"
+        required: true
+        default: "2"
+      max_countries:
+        description: "Max countries to process from the list"
+        required: true
+        default: "10"
+      delay_ms:
+        description: "Delay between page loads (ms)"
+        required: true
+        default: "3000"
+
+permissions:
+  contents: read
+
+jobs:
+  browser-collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: package.json
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Check login secrets
+        env:
+          SHODAN_USERNAME: ${{ secrets.SHODAN_USERNAME }}
+          SHODAN_PASSWORD: ${{ secrets.SHODAN_PASSWORD }}
+          SHODAN_COOKIE: ${{ secrets.SHODAN_COOKIE }}
+        run: |
+          if [ -z "$SHODAN_USERNAME" ] || [ -z "$SHODAN_PASSWORD" ]; then
+            if [ -z "$SHODAN_COOKIE" ]; then
+              echo "::error::Set secrets SHODAN_USERNAME + SHODAN_PASSWORD (or SHODAN_COOKIE)."
+              exit 1
+            fi
+            echo "WARNING: using SHODAN_COOKIE fallback without username/password"
+          else
+            echo "Login secrets present"
+          fi
+
+      - name: Login + collect free pages
+        env:
+          SHODAN_QUERY: ${{ github.event.inputs.query }}
+          SHODAN_COUNTRIES: ${{ github.event.inputs.countries }}
+          SHODAN_MAX_PAGES: ${{ github.event.inputs.max_pages }}
+          SHODAN_MAX_COUNTRIES: ${{ github.event.inputs.max_countries }}
+          SHODAN_DELAY_MS: ${{ github.event.inputs.delay_ms }}
+          SHODAN_USERNAME: ${{ secrets.SHODAN_USERNAME }}
+          SHODAN_PASSWORD: ${{ secrets.SHODAN_PASSWORD }}
+          SHODAN_COOKIE: ${{ secrets.SHODAN_COOKIE }}
+          SHODAN_CONTINUE_URL: https://www.shodan.io
+          SHODAN_OUT_DIR: out
+          HEADLESS: "true"
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          PAGES="${SHODAN_MAX_PAGES}"
+          if [ "$PAGES" -gt 2 ]; then PAGES=2; fi
+          if [ "$PAGES" -lt 1 ]; then PAGES=1; fi
+
+          node shodan-browser-collect.js \
+            --query "$SHODAN_QUERY" \
+            --countries "$SHODAN_COUNTRIES" \
+            --max-pages "$PAGES" \
+            --max-countries "$SHODAN_MAX_COUNTRIES" \
+            --delay "$SHODAN_DELAY_MS" \
+            --out-dir out
+
+          echo "---- sample ----"
+          head -n 30 out/hosts.txt || true
+          echo "---- counts ----"
+          wc -l out/hosts.txt out/hosts.csv || true
+          ls -lah out || true
+
+      - name: Upload hosts artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shodan-browser-hosts-${{ github.run_id }}
+          path: |
+            out/hosts.csv
+            out/hosts.txt
+            out/browser-summary.json
+            out/shodan-storage-state.json
+            out/debug-*.png
+            out/debug-*.html
+            out/debug-*-meta.json
+          if-no-files-found: warn
+          retention-days: 14
